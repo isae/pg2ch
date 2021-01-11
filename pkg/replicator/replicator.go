@@ -18,15 +18,15 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/consumer"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/tableengines"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/chload"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/consumer"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/tableengines"
+	"pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/utils/chutils/bulkupload"
+	"pg2ch/pkg/utils/chutils/chload"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/kvstorage"
 )
 
 type clickHouseTable interface {

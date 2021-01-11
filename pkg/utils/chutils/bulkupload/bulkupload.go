@@ -8,9 +8,9 @@ import (
 	"gopkg.in/djherbis/buffer.v1"
 	"gopkg.in/djherbis/nio.v2"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/utils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/utils"
+	"pg2ch/pkg/utils/chutils"
 )
 
 type BulkUploader interface {

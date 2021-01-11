@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
 	"github.com/peterbourgon/diskv"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 type diskvStorage struct {
@@ -49,15 +49,19 @@ func (s *diskvStorage) WriteLSN(key string, lsn dbtypes.LSN) error {
 }
 
 func (s *diskvStorage) ReadUint(key string) (uint64, error) {
-	val, err := strconv.ParseUint(s.storage.ReadString(key), 10, 64)
+	cacheData, err := s.storage.Read(key)
 	if err != nil {
+		return 0, err
+	}
+	val, err2 := strconv.ParseUint(string(cacheData), 10, 64)
+	if err2 != nil {
 		return 0, err
 	}
 	return val, nil
 }
 
 func (s *diskvStorage) WriteUint(key string, val uint64) error {
-	return s.storage.WriteString(key, fmt.Sprintf("%v", val))
+	return s.storage.Write(key, []byte(fmt.Sprintf("%v", val)))
 }
 
 func (s *diskvStorage) Keys() []string {

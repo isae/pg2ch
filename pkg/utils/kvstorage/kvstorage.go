@@ -3,7 +3,7 @@ package kvstorage
 import (
 	"fmt"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 type KVStorage interface {

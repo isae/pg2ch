@@ -14,8 +14,8 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/yaml.v2"
 
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 const (

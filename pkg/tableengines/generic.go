@@ -10,14 +10,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/chload"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils"
+	"pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/utils/chutils/bulkupload"
+	"pg2ch/pkg/utils/chutils/chload"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/kvstorage"
 )
 
 // Generic table is a "parent" struct for all the table engines

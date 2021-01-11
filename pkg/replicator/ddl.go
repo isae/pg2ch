@@ -7,10 +7,10 @@ import (
 
 	"gopkg.in/yaml.v2"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/tableinfo"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/tableinfo"
 )
 
 const (

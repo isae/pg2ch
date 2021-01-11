@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/pgtype"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 type (

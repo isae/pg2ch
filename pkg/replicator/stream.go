@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 func (r *Replicator) tblBuffersFlush() error { // protected by inTxMutex: inactivity merge or on commit

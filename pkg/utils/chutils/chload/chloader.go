@@ -2,9 +2,9 @@ package chload
 
 import (
 	"bytes"
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/utils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/utils"
+	"pg2ch/pkg/utils/chutils"
 )
 
 const (

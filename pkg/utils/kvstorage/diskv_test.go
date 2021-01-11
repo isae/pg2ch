@@ -6,9 +6,9 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
 	"github.com/stretchr/testify/assert"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/kvstorage"
 )
 
 func testStorage(t *testing.T, storage kvstorage.KVStorage) {

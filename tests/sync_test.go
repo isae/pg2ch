@@ -12,9 +12,9 @@ import (
 	"github.com/ildus/pqt"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/replicator"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/replicator"
+	"pg2ch/pkg/utils/chutils"
 )
 
 const (

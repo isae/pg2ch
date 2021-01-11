@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
 	"golang.org/x/sys/unix"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 type mmapStorage struct {

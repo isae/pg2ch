@@ -3,10 +3,10 @@ package tableengines
 import (
 	"github.com/jackc/pgx"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/chutils/bulkupload"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 // collapsingMergeTree is extended with engine-specific properties

@@ -3,8 +3,8 @@ package tableinfo
 import (
 	"fmt"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/utils/chutils"
 )
 
 func TableChColumns(conn *chutils.CHConn, chTable config.ChTableName) (map[string]config.ChColumn, error) {

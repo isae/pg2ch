@@ -10,7 +10,7 @@ import (
 
 	"gopkg.in/djherbis/buffer.v1"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
+	"pg2ch/pkg/config"
 )
 
 type chConnMock struct {

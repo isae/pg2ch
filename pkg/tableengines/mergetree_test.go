@@ -12,10 +12,10 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/djherbis/buffer.v1"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/kvstorage"
 )
 
 type mockBulkUploader struct {

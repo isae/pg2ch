@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
+	"pg2ch/pkg/config"
 )
 
 type CHConnector interface {

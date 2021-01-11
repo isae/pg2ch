@@ -9,9 +9,9 @@ import (
 	"github.com/jackc/pgx"
 	"go.uber.org/zap"
 
-	"github.com/mkabilov/pg2ch/pkg/decoder"
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/decoder"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 const (

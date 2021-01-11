@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"github.com/mkabilov/pg2ch/pkg/config"
 	"io"
 	"io/ioutil"
+	"pg2ch/pkg/config"
 	"testing"
 )
 

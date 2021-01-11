@@ -3,8 +3,8 @@ package replicator
 import (
 	"fmt"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/message"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/message"
 )
 
 func (r *Replicator) PreparePgTables() error {

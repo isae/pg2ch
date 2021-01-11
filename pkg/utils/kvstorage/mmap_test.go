@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
+	"pg2ch/pkg/utils/kvstorage"
 )
 
 func TestMmapBasic(t *testing.T) {

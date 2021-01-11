@@ -8,11 +8,11 @@ import (
 	"github.com/jackc/pgx"
 	"gopkg.in/djherbis/buffer.v1"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/pgutils"
+	"pg2ch/pkg/config"
+	"pg2ch/pkg/utils/chutils"
+	"pg2ch/pkg/utils/chutils/bulkupload"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/pgutils"
 )
 
 func (r *Replicator) SyncTables(syncTables []config.PgTableName, async bool) error {

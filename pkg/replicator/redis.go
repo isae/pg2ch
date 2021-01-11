@@ -7,7 +7,7 @@ import (
 
 	"github.com/tidwall/redcon"
 
-	"github.com/mkabilov/pg2ch/pkg/config"
+	"pg2ch/pkg/config"
 )
 
 func (r *Replicator) startRedisServer() {

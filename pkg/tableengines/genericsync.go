@@ -8,10 +8,10 @@ import (
 
 	"github.com/jackc/pgx"
 
-	"github.com/mkabilov/pg2ch/pkg/utils"
-	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
-	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
-	"github.com/mkabilov/pg2ch/pkg/utils/pgutils"
+	"pg2ch/pkg/utils"
+	"pg2ch/pkg/utils/chutils/bulkupload"
+	"pg2ch/pkg/utils/dbtypes"
+	"pg2ch/pkg/utils/pgutils"
 )
 
 const (
