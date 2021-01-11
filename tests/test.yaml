@@ -1,0 +1,40 @@
+tables:
+    pg1:
+        main_table: ch1
+        sync_aux_table: ch1_aux
+        engine: CollapsingMergeTree
+        init_sync_skip_truncate: true
+        sign_column: sign
+
+    pg2:
+        main_table: ch2
+        sync_aux_table: ch2_aux
+        engine: CollapsingMergeTree
+        init_sync_skip_truncate: true
+        sign_column: sign
+
+    pg3:
+        main_table: ch3
+        sync_aux_table: ch3_aux
+        engine: CollapsingMergeTree
+        init_sync_skip_truncate: true
+        sign_column: sign
+
+inactivity_merge_timeout: '1s'
+
+clickhouse:
+    host: localhost
+    port: 8123
+    database: pg2ch_test
+    username: default
+postgres:
+    host: localhost
+    database: postgres
+    user: postgres
+    replication_slot_name: pg2ch_slot
+    publication_name: pg2ch_pub
+
+db_path: /tmp/db
+db_type: mmap
+loglevel: info
+gzip_compression: bestspeed

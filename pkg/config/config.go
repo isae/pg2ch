@@ -1,31 +1,48 @@
 package config
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/yaml.v2"
 
 	"github.com/mkabilov/pg2ch/pkg/message"
+	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
 )
 
 const (
-	defaultInactivityMergeTimeout = time.Minute
-	publicSchema                  = "public"
-	defaultClickHousePort         = 9000
-	defaultClickHouseHost         = "127.0.0.1"
-	defaultPostgresPort           = 5432
-	defaultPostgresHost           = "127.0.0.1"
-	defaultRowIdColumn            = "row_id"
-	defaultMaxBufferLength        = 1000
-	defaultSignColumn             = "sign"
-	defaultVerColumn              = "ver"
-	defaultIsDeletedColumn        = "is_deleted"
+	ApplicationName = "pg2ch"
+
+	publicSchema                 = "public"
+	defaultClickHousePort        = 8123
+	defaultClickHouseHost        = "127.0.0.1"
+	defaultPostgresHost          = "127.0.0.1"
+	DefaultRowIDColumn           = "row_id"
+	defaultBufferSize            = 1000
+	defaultGzipBufferSize        = 10485760
+	defaultPipeBufferSize        = 10485760
+	defaultCreateSlotMaxAttempts = 100
+	defaultSignColumn            = "sign"
+	defaultLsnColumn             = "lsn"
+	defaultIsDeletedColumn       = "is_deleted"
+	defaultTableNameColumnName   = "table_name"
+	defaultPerStorageType        = "diskv"
+
+	TableLSNKeyPrefix = "table_lsn_"
+)
+
+/* these variables could be changed in tests */
+var (
+	DefaultPostgresPort           uint16 = 5432
+	DefaultInactivityMergeTimeout        = time.Minute
 )
 
 type tableEngine int
@@ -41,17 +58,30 @@ const (
 	MergeTree
 )
 
-var tableEngines = map[tableEngine]string{
-	CollapsingMergeTree: "CollapsingMergeTree",
-	ReplacingMergeTree:  "ReplacingMergeTree",
-	MergeTree:           "MergeTree",
-}
+var (
+	tableEngines = map[tableEngine]string{
+		CollapsingMergeTree: "CollapsingMergeTree",
+		ReplacingMergeTree:  "ReplacingMergeTree",
+		MergeTree:           "MergeTree",
+	}
+
+	compressionLevels = map[string]int{
+		"no":              flate.NoCompression,
+		"bestspeed":       flate.BestSpeed,
+		"bestcompression": flate.BestCompression,
+		"default":         flate.DefaultCompression,
+		"huffmanonly":     flate.HuffmanOnly,
+	}
+)
+
+type GzipComprLevel int
 
 type pgConnConfig struct {
 	pgx.ConnConfig `yaml:",inline"`
 
 	ReplicationSlotName string `yaml:"replication_slot_name"`
 	PublicationName     string `yaml:"publication_name"`
+	Debug               bool   `yaml:"debug"`
 }
 
 // PgTableName represents namespaced name
@@ -60,30 +90,45 @@ type PgTableName struct {
 	TableName  string
 }
 
-// Table contains information about the table
-type Table struct {
-	BufferTableRowIdColumn  string            `yaml:"buffer_table_row_id"`
-	ChBufferTable           string            `yaml:"buffer_table"`
-	ChMainTable             string            `yaml:"main_table"`
-	MaxBufferLength         int               `yaml:"max_buffer_length"`
-	VerColumn               string            `yaml:"ver_column"`
-	IsDeletedColumn         string            `yaml:"is_deleted_column"`
-	SignColumn              string            `yaml:"sign_column"`
-	GenerationColumn        string            `yaml:"generation_column"`
-	Engine                  tableEngine       `yaml:"engine"`
-	FlushThreshold          int               `yaml:"flush_threshold"`
-	InitSyncSkip            bool              `yaml:"init_sync_skip"`
-	InitSyncSkipBufferTable bool              `yaml:"init_sync_skip_buffer_table"`
-	InitSyncSkipTruncate    bool              `yaml:"init_sync_skip_truncate"`
-	Columns                 map[string]string `yaml:"columns"`
-
-	PgTableName   PgTableName         `yaml:"-"`
-	TupleColumns  []message.Column    `yaml:"-"` // columns in the order they are in the table
-	PgColumns     map[string]PgColumn `yaml:"-"`
-	ColumnMapping map[string]ChColumn `yaml:"-"`
+type ChTableName struct {
+	DatabaseName string
+	TableName    string
+	Temporary    bool
 }
 
-type chConnConfig struct {
+type coalesceValue []byte
+
+// ColumnProperty describes column properties
+type ColumnProperty struct {
+	IstoreKeysSuffix   string        `yaml:"istore_keys_suffix"`
+	IstoreValuesSuffix string        `yaml:"istore_values_suffix"`
+	Coalesce           coalesceValue `yaml:"coalesce"`
+}
+
+// Table contains information about the table
+type Table struct {
+	ChMainTable          ChTableName                `yaml:"main_table"`
+	ChSyncAuxTable       ChTableName                `yaml:"sync_aux_table"`
+	IsDeletedColumn      string                     `yaml:"is_deleted_column"`
+	SignColumn           string                     `yaml:"sign_column"`
+	RowIDColumnName      string                     `yaml:"row_id_column"`
+	TableNameColumnName  string                     `yaml:"table_name_column_name"`
+	Engine               tableEngine                `yaml:"engine"`
+	BufferSize           int                        `yaml:"max_buffer_length"`
+	InitSyncSkip         bool                       `yaml:"init_sync_skip"`
+	InitSyncSkipTruncate bool                       `yaml:"init_sync_skip_truncate"`
+	Columns              map[string]string          `yaml:"columns"`
+	ColumnProperties     map[string]*ColumnProperty `yaml:"column_properties"`
+	LsnColumnName        string                     `yaml:"lsn_column_name"`
+
+	PgOID         dbtypes.OID          `yaml:"-"`
+	PgTableName   PgTableName          `yaml:"-"`
+	TupleColumns  []message.Column     `yaml:"-"` // columns in the order they are in the table
+	PgColumns     map[string]*PgColumn `yaml:"-"` // map of pg column structs
+	ColumnMapping map[string]ChColumn  `yaml:"-"` // mapping pg column -> ch column
+}
+
+type CHConnConfig struct {
 	Host     string            `yaml:"host"`
 	Port     uint32            `yaml:"port"`
 	Database string            `yaml:"database"`
@@ -94,12 +139,20 @@ type chConnConfig struct {
 
 // Config contains config
 type Config struct {
-	ClickHouse             chConnConfig          `yaml:"clickhouse"`
-	Postgres               pgConnConfig          `yaml:"postgres"`
-	Tables                 map[PgTableName]Table `yaml:"tables"`
-	InactivityFlushTimeout time.Duration         `yaml:"inactivity_flush_timeout"`
-	PersStoragePath        string                `yaml:"db_path"`
-	RedisBind              string                `yaml:"redis_bind"`
+	ClickHouse             CHConnConfig           `yaml:"clickhouse"`
+	Postgres               pgConnConfig           `yaml:"postgres"`
+	Tables                 map[PgTableName]*Table `yaml:"tables"`
+	InactivityFlushTimeout time.Duration          `yaml:"inactivity_flush_timeout"`
+	PersStoragePath        string                 `yaml:"db_path"`
+	PersStorageType        string                 `yaml:"db_type"`
+	RedisBind              string                 `yaml:"redis_bind"`
+	PprofBind              string                 `yaml:"pprof_bind"`
+	SyncWorkers            int                    `yaml:"sync_workers"`
+	LogLevel               zapcore.Level          `yaml:"loglevel"`
+	GzipBufSize            int                    `yaml:"gzip_buffer_size"`
+	GzipCompression        GzipComprLevel         `yaml:"gzip_compression"`
+	PipeBufferSize         int64                  `yaml:"pipe_buffer_size"`
+	CreateSlotMaxAttempts  int                    `yaml:"create_slot_max_attempts"`
 }
 
 type Column struct {
@@ -137,7 +190,7 @@ func (t *tableEngine) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 
 	for k, v := range tableEngines {
-		if strings.ToLower(val) == strings.ToLower(v) {
+		if strings.EqualFold(val, v) {
 			*t = k
 			return nil
 		}
@@ -165,6 +218,18 @@ func (tn *PgTableName) Parse(val string) error {
 	return nil
 }
 
+func (cv *coalesceValue) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var val string
+
+	if err := unmarshal(&val); err != nil {
+		return err
+	}
+
+	*cv = []byte(val)
+
+	return nil
+}
+
 func (tn *PgTableName) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	//TODO: improve parser, use regexp
 	var val string
@@ -180,7 +245,47 @@ func (tn PgTableName) MarshalYAML() (interface{}, error) {
 	return tn.String(), nil
 }
 
-func (tn *PgTableName) String() string {
+func (gc *GzipComprLevel) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var str string
+
+	if err := unmarshal(&str); err != nil {
+		return err
+	}
+
+	if str == "" {
+		*gc = GzipComprLevel(flate.NoCompression)
+
+		return nil
+	}
+
+	val, ok := compressionLevels[strings.ToLower(str)]
+	if !ok {
+		return fmt.Errorf("unknown compression level %q", str)
+	}
+	*gc = GzipComprLevel(val)
+
+	return nil
+}
+
+func (gc GzipComprLevel) String() string {
+	for k, v := range compressionLevels {
+		if v == int(gc) {
+			return k
+		}
+	}
+
+	return "unknown" //should never happen
+}
+
+func (gc GzipComprLevel) UseCompression() bool {
+	return gc != gzip.NoCompression
+}
+
+func (tn PgTableName) String() string {
+	return tn.NamespacedName()
+}
+
+func (tn PgTableName) NamespacedName() string {
 	if tn.SchemaName == publicSchema {
 		return fmt.Sprintf("%s", tn.TableName)
 	}
@@ -188,9 +293,24 @@ func (tn *PgTableName) String() string {
 	return fmt.Sprintf(`%s.%s`, tn.SchemaName, tn.TableName)
 }
 
+func (tn PgTableName) KeyName() string {
+	return TableLSNKeyPrefix + tn.String()
+}
+
+func (tn *PgTableName) ParseKey(key string) error {
+	if len(key) < len(TableLSNKeyPrefix) {
+		return fmt.Errorf("too short key name")
+	}
+	if !strings.HasPrefix(key, TableLSNKeyPrefix) {
+		return fmt.Errorf("wrong key: %v", key)
+	}
+
+	return tn.Parse(key[len(TableLSNKeyPrefix):])
+}
+
 // New instantiates config
 func New(filepath string) (*Config, error) {
-	var cfg Config
+	cfg := &Config{}
 
 	fp, err := os.Open(filepath)
 	if err != nil {
@@ -202,34 +322,27 @@ func New(filepath string) (*Config, error) {
 		}
 	}()
 
-	if err := yaml.NewDecoder(fp).Decode(&cfg); err != nil {
+	if err := yaml.NewDecoder(fp).Decode(cfg); err != nil {
 		return nil, fmt.Errorf("could not decode yaml: %v", err)
 	}
 
-	if cfg.Postgres.PublicationName == "" {
+	if len(cfg.Postgres.PublicationName) == 0 {
 		return nil, fmt.Errorf("publication name is not specified")
 	}
 
-	if cfg.Postgres.ReplicationSlotName == "" {
+	if len(cfg.Postgres.ReplicationSlotName) == 0 {
 		return nil, fmt.Errorf("replication slot name is not specified")
 	}
 
-	connCfg, err := pgx.ParseEnvLibpq()
-	if err != nil {
-		return nil, fmt.Errorf("could not parse lib pq env variabels: %v", err)
-	}
-
 	if cfg.InactivityFlushTimeout.Seconds() == 0 {
-		cfg.InactivityFlushTimeout = defaultInactivityMergeTimeout
+		cfg.InactivityFlushTimeout = DefaultInactivityMergeTimeout
 	}
-
-	cfg.Postgres.ConnConfig = cfg.Postgres.ConnConfig.Merge(connCfg)
 
 	if cfg.Postgres.Port == 0 {
-		cfg.Postgres.Port = defaultPostgresPort
+		cfg.Postgres.Port = DefaultPostgresPort
 	}
 
-	if cfg.Postgres.Host == "" {
+	if len(cfg.Postgres.Host) == 0 {
 		cfg.Postgres.Host = defaultPostgresHost
 	}
 
@@ -237,15 +350,84 @@ func New(filepath string) (*Config, error) {
 		cfg.ClickHouse.Port = defaultClickHousePort
 	}
 
-	if cfg.ClickHouse.Host == "" {
+	if len(cfg.ClickHouse.Host) == 0 {
 		cfg.ClickHouse.Host = defaultClickHouseHost
 	}
 
-	if cfg.PersStoragePath == "" {
+	if len(cfg.PersStoragePath) == 0 {
 		return nil, fmt.Errorf("db_filepath is not set")
 	}
 
-	return &cfg, nil
+	if len(cfg.PersStorageType) == 0 {
+		cfg.PersStorageType = defaultPerStorageType
+	}
+
+	if cfg.SyncWorkers == 0 {
+		cfg.SyncWorkers = 1
+	}
+
+	for _, tbl := range cfg.Tables {
+		if !tbl.ChMainTable.IsEmpty() && tbl.ChMainTable.DatabaseName == "" {
+			tbl.ChMainTable.DatabaseName = cfg.ClickHouse.Database
+		}
+		if !tbl.ChSyncAuxTable.IsEmpty() && tbl.ChSyncAuxTable.DatabaseName == "" {
+			tbl.ChSyncAuxTable.DatabaseName = cfg.ClickHouse.Database
+		}
+		if tbl.BufferSize == 0 {
+			tbl.BufferSize = defaultBufferSize
+		}
+	}
+
+	if cfg.GzipBufSize == 0 && cfg.GzipCompression != flate.NoCompression {
+		cfg.GzipBufSize = defaultGzipBufferSize
+	}
+
+	if cfg.PipeBufferSize == 0 {
+		cfg.PipeBufferSize = defaultPipeBufferSize
+	}
+
+	if cfg.CreateSlotMaxAttempts == 0 {
+		cfg.CreateSlotMaxAttempts = defaultCreateSlotMaxAttempts
+	}
+
+	return cfg, nil
+}
+
+func (ct ChTableName) NamespacedName() string {
+	return fmt.Sprintf("%s.%s", ct.DatabaseName, ct.TableName)
+}
+
+func (ct ChTableName) String() string {
+	return fmt.Sprintf("%s.%s", ct.DatabaseName, ct.TableName)
+}
+
+func (ct ChTableName) IsEmpty() bool {
+	return ct.DatabaseName == "" && ct.TableName == ""
+}
+
+func (ct *ChTableName) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var val string
+
+	if err := unmarshal(&val); err != nil {
+		return err
+	}
+
+	parts := strings.Split(val, ".")
+	if ln := len(parts); ln == 2 {
+		*ct = ChTableName{
+			DatabaseName: parts[0],
+			TableName:    parts[1],
+		}
+	} else if ln == 1 {
+		*ct = ChTableName{
+			DatabaseName: "",
+			TableName:    parts[0],
+		}
+	} else {
+		return fmt.Errorf("too many parts in the table name")
+	}
+
+	return nil
 }
 
 // UnmarshalYAML ...
@@ -257,10 +439,9 @@ func (t *Table) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	if val.ChBufferTable != "" && val.BufferTableRowIdColumn == "" {
-		val.BufferTableRowIdColumn = defaultRowIdColumn
+	if val.RowIDColumnName == "" {
+		val.RowIDColumnName = DefaultRowIDColumn
 	}
-
 	if val.SignColumn == "" && val.Engine == CollapsingMergeTree {
 		val.SignColumn = defaultSignColumn
 	}
@@ -269,12 +450,12 @@ func (t *Table) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		val.IsDeletedColumn = defaultIsDeletedColumn
 	}
 
-	if val.VerColumn == "" && val.Engine == ReplacingMergeTree {
-		val.VerColumn = defaultVerColumn
+	if val.LsnColumnName == "" {
+		val.LsnColumnName = defaultLsnColumn
 	}
 
-	if val.MaxBufferLength == 0 {
-		val.MaxBufferLength = defaultMaxBufferLength
+	if val.TableNameColumnName == "" {
+		val.TableNameColumnName = defaultTableNameColumnName
 	}
 
 	*t = Table(val)
@@ -282,17 +463,51 @@ func (t *Table) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// ConnectionString returns clickhouse connection string
-func (c *chConnConfig) ConnectionString() string {
-	connStr := url.Values{}
+func (c PgColumn) IsIstore() bool {
+	return c.BaseType == dbtypes.PgAdjustIstore || c.BaseType == dbtypes.PgAdjustBigIstore
+}
 
-	connStr.Add("username", c.User)
-	connStr.Add("password", c.Password)
-	connStr.Add("database", c.Database)
+func (c PgColumn) IsTime() bool {
+	return c.BaseType == dbtypes.PgAdjustAjTime ||
+		c.BaseType == dbtypes.PgTimestampWithoutTimeZone ||
+		c.BaseType == dbtypes.PgTimestampWithTimeZone ||
+		c.BaseType == dbtypes.PgDate ||
+		c.BaseType == dbtypes.PgAdjustAjDate
+}
 
-	for param, value := range c.Params {
-		connStr.Add(param, value)
+func (c Config) Print() {
+	fmt.Fprintf(os.Stderr, "inactivity flush timeout: %v\n", c.InactivityFlushTimeout)
+	fmt.Fprintf(os.Stderr, "logging level: %s\n", c.LogLevel)
+	fmt.Fprintf(os.Stderr, "number of sync workers: %d\n", c.SyncWorkers)
+	fmt.Fprintf(os.Stderr, "gzip compression level: %v\n", c.GzipCompression)
+	if c.GzipCompression != flate.NoCompression {
+		fmt.Fprintf(os.Stderr, "gzip buffer size: %v\n", c.GzipBufSize)
+	}
+	fmt.Fprintf(os.Stderr, "pipe buffer size: %v\n", c.PipeBufferSize)
+	fmt.Fprintf(os.Stderr, "create slot max attempts: %v\n", c.CreateSlotMaxAttempts)
+
+	targetTables := make(map[string][]string)
+	for pgTable, tblCfg := range c.Tables {
+		chTableStr := tblCfg.ChMainTable.String()
+		pgTableStr := pgTable.String()
+		if !tblCfg.ChSyncAuxTable.IsEmpty() {
+			pgTableStr += fmt.Sprintf(" aux: %s", tblCfg.ChSyncAuxTable.String())
+		}
+		pgTableStr += fmt.Sprintf(" flush threshold: %v", tblCfg.BufferSize)
+		if _, ok := targetTables[chTableStr]; ok {
+			targetTables[chTableStr] = append(targetTables[chTableStr], pgTableStr)
+		} else {
+			targetTables[chTableStr] = []string{pgTableStr}
+		}
 	}
 
-	return fmt.Sprintf("tcp://%s:%d?%s", c.Host, c.Port, connStr.Encode())
+	fmt.Fprintf(os.Stderr, "clickhouse table - postgres table(s) mapping\n")
+	for chTable, pgTables := range targetTables {
+		fmt.Fprintf(os.Stderr, "%s:\n", chTable)
+		sort.Strings(pgTables)
+		for _, pgTable := range pgTables {
+			fmt.Fprintf(os.Stderr, "\t%s\n", pgTable)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+	}
 }

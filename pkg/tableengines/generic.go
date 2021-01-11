@@ -3,78 +3,102 @@ package tableengines
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"fmt"
-	"io"
-	"log"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx"
+	"go.uber.org/zap"
 
 	"github.com/mkabilov/pg2ch/pkg/config"
 	"github.com/mkabilov/pg2ch/pkg/message"
 	"github.com/mkabilov/pg2ch/pkg/utils"
+	"github.com/mkabilov/pg2ch/pkg/utils/chutils"
+	"github.com/mkabilov/pg2ch/pkg/utils/chutils/bulkupload"
+	"github.com/mkabilov/pg2ch/pkg/utils/chutils/chload"
+	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
+	"github.com/mkabilov/pg2ch/pkg/utils/kvstorage"
 )
 
 // Generic table is a "parent" struct for all the table engines
 const (
-	attemptInterval = time.Second
-	maxAttempts     = 100
+	flushBufferAttemptInterval = 5 * time.Second
+	maxFlushBufferAttempts     = 1000
+
+	columnDelimiter = '\t'
 )
 
-const (
-	pgTrue  = "t"
-	pgFalse = "f"
+var (
+	zeroStr     = []byte("0")
+	oneStr      = []byte("1")
+	minusOneStr = []byte("-1")
 )
 
-type bufRow struct {
-	rowID int
-	data  []interface{}
+type chTuple struct {
+	row   message.Row
+	extra [][]byte
 }
-
-type commandSet [][]interface{}
-
-type bufCommand []bufRow
 
 type genericTable struct {
-	ctx     context.Context
-	chConn  *sql.DB
-	chTx    *sql.Tx
-	chStmnt *sql.Stmt
+	*sync.Mutex // We set lock on begin and unset it on commit
 
-	cfg config.Table
+	ctx          context.Context
+	bufferMaxLSN dbtypes.LSN // max lsn in the buffer
+	chLoader     chload.CHLoader
 
-	chUsedColumns  []string
-	pgUsedColumns  []string
-	columnMapping  map[string]config.ChColumn // [pg column name]ch column description
-	flushMutex     *sync.Mutex
-	buffer         []bufCommand
-	bufferCmdId    int // number of commands in the current buffer
-	bufferRowId    int // row id in the buffer
-	bufferFlushCnt int // number of flushed buffers
-	flushQueries   []string
-	tupleColumns   []message.Column // Columns description taken from RELATION rep message
-	generationID   *uint64
+	cfg           *config.Table
+	chUsedColumns []string
+	pgUsedColumns []string
+	columnMapping map[string]config.ChColumn // [pg column name]ch column description
+	tupleColumns  []message.Column           // Columns description taken from RELATION rep message
+
+	lastCommittedLSN   dbtypes.LSN // last committed finalLSN
+	memFlushMutex      *sync.Mutex // memory flush can be triggered from the inactivity merge goroutine as well
+	memBufferPgDMLsCnt int         // number of pg DML commands in the current buffer,
+	// i.e. 1 update pg dml command => 2 ch inserts: with -1 sign, and +1 sign
+
+	inSync            bool          // protected via table mutex
+	syncedRows        uint64        // number of processed rows during the sync
+	liveTuples        uint64        // number of live tuples taken from pg_statistics table, i.e. approx num of rows
+	syncBuf           *bytes.Buffer // buffer for various things during the sync
+	syncLastBatchTime time.Time     //to calculate rate
+	auxTblRowID       uint64        // row_id stored in the aux table
+	pgTableName       []byte        // table name for the table_name_column_name column
+
+	bulkUploader    bulkupload.BulkUploader // used only during the sync
+	syncSnapshotLSN dbtypes.LSN             // LSN of the initial copy snapshot, protected via table mutex
+	persStorage     kvstorage.KVStorage     // persistent storage for the processed lsn positions
+	logger          *zap.SugaredLogger
+
+	txFinalLSN dbtypes.LSN // finalLSN of the currently processing transaction
+
+	//used only during the sync
+	syncPgColumns map[int]*config.PgColumn       // pg columns as they go in the 'select *' statement
+	syncColProps  map[int]*config.ColumnProperty // column properties as they go in the 'select *' statement
 }
 
-func newGenericTable(ctx context.Context, chConn *sql.DB, tblCfg config.Table, genID *uint64) genericTable {
+//noinspection GoExportedFuncWithUnexportedType
+func NewGenericTable(ctx context.Context, logger *zap.SugaredLogger, persStorage kvstorage.KVStorage,
+	loader chload.CHLoader, tblCfg *config.Table) genericTable {
 	t := genericTable{
+		Mutex:         &sync.Mutex{},
+		memFlushMutex: &sync.Mutex{},
+		syncBuf:       &bytes.Buffer{},
 		ctx:           ctx,
-		chConn:        chConn,
+		chLoader:      loader,
 		cfg:           tblCfg,
 		columnMapping: make(map[string]config.ChColumn),
 		chUsedColumns: make([]string, 0),
 		pgUsedColumns: make([]string, 0),
-		flushMutex:    &sync.Mutex{},
 		tupleColumns:  tblCfg.TupleColumns,
-		generationID:  genID,
+		persStorage:   persStorage,
+		logger:        logger.With("table", tblCfg.PgTableName.String()),
+		pgTableName:   []byte(tblCfg.PgTableName.NamespacedName()),
+		syncPgColumns: make(map[int]*config.PgColumn),
+		syncColProps:  make(map[int]*config.ColumnProperty),
 	}
 
-	t.buffer = make([]bufCommand, t.cfg.MaxBufferLength)
-
+	pgUsedColID := 0
 	for _, pgCol := range t.tupleColumns {
 		chCol, ok := tblCfg.ColumnMapping[pgCol.Name]
 		if !ok {
@@ -82,473 +106,224 @@ func newGenericTable(ctx context.Context, chConn *sql.DB, tblCfg config.Table, g
 		}
 
 		t.columnMapping[pgCol.Name] = chCol
-		t.chUsedColumns = append(t.chUsedColumns, chCol.Name)
 		t.pgUsedColumns = append(t.pgUsedColumns, pgCol.Name)
+		t.syncPgColumns[pgUsedColID] = t.cfg.PgColumns[pgCol.Name]
+		t.syncColProps[pgUsedColID] = t.cfg.ColumnProperties[pgCol.Name]
+		pgUsedColID++
+
+		if tblCfg.PgColumns[pgCol.Name].IsIstore() {
+			if columnCfg, ok := tblCfg.ColumnProperties[pgCol.Name]; ok {
+				t.chUsedColumns = append(t.chUsedColumns, fmt.Sprintf("%s_%s", chCol.Name, columnCfg.IstoreKeysSuffix))
+				t.chUsedColumns = append(t.chUsedColumns, fmt.Sprintf("%s_%s", chCol.Name, columnCfg.IstoreValuesSuffix))
+			}
+		} else {
+			t.chUsedColumns = append(t.chUsedColumns, chCol.Name)
+		}
 	}
 
-	if tblCfg.GenerationColumn != "" {
-		t.chUsedColumns = append(t.chUsedColumns, tblCfg.GenerationColumn)
-	}
+	t.chUsedColumns = append(t.chUsedColumns, tblCfg.LsnColumnName)
+	t.chUsedColumns = append(t.chUsedColumns, tblCfg.TableNameColumnName)
 
 	return t
 }
 
-func (t *genericTable) truncateMainTable() error {
-	if _, err := t.chConn.Exec(fmt.Sprintf("truncate table %s", t.cfg.ChMainTable)); err != nil {
+func (t *genericTable) truncateTable(tableName config.ChTableName) error {
+	t.logger.Infof("truncating %q table", tableName)
+
+	return t.chLoader.Exec(fmt.Sprintf("truncate table %s.%s", tableName.DatabaseName, tableName.TableName))
+}
+
+func (t *genericTable) createAuxTable(tableName config.ChTableName,
+	like config.ChTableName) error {
+
+	t.logger.Infof("creating %q table like %q", tableName, like)
+
+	err := t.chLoader.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %[3]s ENGINE=MergeTree()
+		ORDER BY %[1]s PARTITION BY %[2]s as
+			SELECT *, toUInt64(0) as row_id FROM %[4]s LIMIT 0;`,
+		t.cfg.RowIDColumnName, t.cfg.TableNameColumnName,
+		tableName.String(), like.String()))
+	if err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (t *genericTable) truncateBufTable() error {
-	if t.cfg.ChBufferTable == "" {
-		return nil
-	}
+func (t *genericTable) dropTablePartition(tableName config.ChTableName, partitionName string) error {
+	t.logger.Infof("dropping %q partiton of the %q table", partitionName, tableName)
 
-	if _, err := t.chConn.Exec(fmt.Sprintf("truncate table %s", t.cfg.ChBufferTable)); err != nil {
-		return err
+	return t.chLoader.Exec(fmt.Sprintf("alter table %s drop partition '%s'",
+		tableName.String(), partitionName))
+}
+
+func (t *genericTable) advanceProcessedLSN() error {
+	if t.bufferMaxLSN >= t.lastCommittedLSN {
+		return t.saveLSN(t.lastCommittedLSN)
 	}
 
 	return nil
 }
 
-func (t *genericTable) stmntPrepare(sync bool) error {
-	var (
-		tableName string
-		err       error
-	)
-
-	columns := t.chUsedColumns
-	if t.cfg.ChBufferTable != "" && ((sync && !t.cfg.InitSyncSkipBufferTable) || !sync) {
-		tableName = t.cfg.ChBufferTable
-		columns = append(columns, t.cfg.BufferTableRowIdColumn)
-	} else {
-		tableName = t.cfg.ChMainTable
-	}
-
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(strings.Split(strings.Repeat("?", len(columns)), ""), ", "))
-
-	t.chStmnt, err = t.chTx.Prepare(query)
-	if err != nil {
-		return fmt.Errorf("could not prepare statement: %v", err)
-	}
-
-	return nil
-}
-
-func (t *genericTable) stmntExec(params []interface{}) error {
-	_, err := t.chStmnt.Exec(params...)
-
-	return err
-}
-
-func (t *genericTable) begin() (err error) {
-	t.chTx, err = t.chConn.Begin()
-
-	return
-}
-
-func (t *genericTable) pgStatLiveTuples(pgTx *pgx.Tx) (int64, error) {
-	var rows sql.NullInt64
-	err := pgTx.QueryRow("select n_live_tup from pg_stat_all_tables where schemaname = $1 and relname = $2",
-		t.cfg.PgTableName.SchemaName,
-		t.cfg.PgTableName.TableName).Scan(&rows)
-	if err != nil || !rows.Valid {
-		return 0, err
-	}
-
-	return rows.Int64, nil
-}
-
-func (t *genericTable) genSync(pgTx *pgx.Tx, w io.Writer) error {
-	if t.cfg.InitSyncSkip {
+func (t *genericTable) writeRow(tuples ...chTuple) error {
+	if len(tuples) == 0 {
 		return nil
 	}
 
-	if err := t.begin(); err != nil {
-		return fmt.Errorf("could not begin: %v", err)
-	}
-
-	tblLiveTuples, err := t.pgStatLiveTuples(pgTx)
-	if err != nil {
-		log.Printf("Could not get approx number of rows in the source table: %v", err)
-	}
-
-	if t.cfg.ChBufferTable != "" && !t.cfg.InitSyncSkipBufferTable {
-		log.Printf("Copy from %s postgres table to %q clickhouse table via %q buffer table started. ~%v rows to copy",
-			t.cfg.PgTableName.String(), t.cfg.ChMainTable, t.cfg.ChBufferTable, tblLiveTuples)
-		if err := t.truncateBufTable(); err != nil {
-			return fmt.Errorf("could not truncate buffer table: %v", err)
-		}
-	} else {
-		log.Printf("Copy from %s postgres table to %q clickhouse table started. ~%v rows to copy",
-			t.cfg.PgTableName.String(), t.cfg.ChMainTable, tblLiveTuples)
-		if !t.cfg.InitSyncSkipTruncate {
-			if err := t.truncateMainTable(); err != nil {
-				return fmt.Errorf("could not truncate main table: %v", err)
+	for _, tuple := range tuples {
+		if t.inSync {
+			// writing to the aux table
+			if err := t.writeRowToBuffer(
+				t.chLoader, // we use the same buffer as during the normal operation
+				tuple.row,
+				t.txFinalLSN,
+				t.pgTableName,
+				append(tuple.extra, []byte(strconv.FormatUint(t.auxTblRowID, 10)))...); err != nil {
+				return err
+			}
+		} else {
+			if err := t.writeRowToBuffer(t.chLoader, tuple.row, t.txFinalLSN, t.pgTableName, tuple.extra...); err != nil {
+				return err
 			}
 		}
 	}
 
-	if err := t.stmntPrepare(true); err != nil {
-		return fmt.Errorf("could not prepare: %v", err)
-	}
-
-	query := fmt.Sprintf("copy %s(%s) to stdout", t.cfg.PgTableName.String(), strings.Join(t.pgUsedColumns, ", "))
-	if _, err := pgTx.CopyToWriter(w, query); err != nil {
-		return fmt.Errorf("could not copy: %v", err)
-	}
-
-	if err := t.stmntCloseCommit(); err != nil {
+	if err := t.chLoader.WriteByte('\n'); err != nil {
 		return err
 	}
-	rows := t.bufferRowId
-	t.bufferCmdId = 0
-	if t.cfg.ChBufferTable != "" && !t.cfg.InitSyncSkipBufferTable {
-		if !t.cfg.InitSyncSkipTruncate {
-			if err := t.truncateMainTable(); err != nil {
-				return fmt.Errorf("could not truncate main table: %v", err)
-			}
+
+	if t.bufferMaxLSN.IsValid() {
+		if t.txFinalLSN > t.bufferMaxLSN {
+			t.bufferMaxLSN = t.txFinalLSN
 		}
-
-		t.bufferFlushCnt++
-		if err := t.FlushToMainTable(); err != nil {
-			return fmt.Errorf("could not move from buffer to the main table: %v", err)
-		}
-	}
-	t.bufferRowId = 0
-	log.Printf("Pg table %s: %d rows copied to ClickHouse %q table", t.cfg.PgTableName.String(), rows, t.cfg.ChMainTable)
-
-	return nil
-}
-
-func (t *genericTable) stmntCloseCommit() error {
-	if err := t.chStmnt.Close(); err != nil {
-		return fmt.Errorf("could not close statement: %v", err)
-	}
-
-	if err := t.chTx.Commit(); err != nil {
-		return fmt.Errorf("could not commit transaction: %v", err)
-	}
-
-	return nil
-}
-
-func (t *genericTable) bufferAppend(cmdSet commandSet) {
-	bufItem := make([]bufRow, len(cmdSet))
-	for i := range cmdSet {
-		bufItem[i] = bufRow{rowID: t.bufferRowId, data: cmdSet[i]}
-		t.bufferRowId++
-	}
-
-	t.buffer[t.bufferCmdId] = bufItem
-	t.bufferCmdId++
-}
-
-func (t *genericTable) processCommandSet(set commandSet) (bool, error) {
-	if set != nil {
-		t.bufferAppend(set)
-	}
-
-	if t.bufferCmdId == t.cfg.MaxBufferLength {
-		t.flushMutex.Lock()
-		defer t.flushMutex.Unlock()
-
-		if err := t.flushBuffer(); err != nil {
-			return false, fmt.Errorf("could not flush buffer: %v", err)
-		}
-	}
-
-	if t.cfg.ChBufferTable == "" {
-		return false, nil
-	}
-
-	return t.bufferFlushCnt >= t.cfg.FlushThreshold, nil
-}
-
-func (t *genericTable) syncConvertIntoRow(p []byte) ([]interface{}, int, error) {
-	rec, err := utils.DecodeCopy(p)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	row, err := t.syncConvertStrings(rec)
-	if err != nil {
-		return nil, 0, fmt.Errorf("could not parse record: %v", err)
-	}
-
-	return row, len(p), nil
-}
-
-func (t *genericTable) insertRow(row []interface{}) error {
-	var chTableName string
-
-	if t.cfg.ChBufferTable != "" && !t.cfg.InitSyncSkipBufferTable {
-		chTableName = t.cfg.ChBufferTable
-		row = append(row, t.bufferRowId)
 	} else {
-		chTableName = t.cfg.ChMainTable
+		t.bufferMaxLSN = t.txFinalLSN
 	}
 
-	if err := t.stmntExec(row); err != nil {
-		return fmt.Errorf("could not insert: %v", err)
-	}
-	t.bufferRowId++
-
-	if t.bufferRowId%1000000 == 0 {
-		log.Printf("clickhouse %q table: %d rows inserted", chTableName, t.bufferRowId)
-	}
+	t.memBufferPgDMLsCnt++
 
 	return nil
 }
 
 func (t *genericTable) flushBuffer() error {
-	var err error
+	t.memFlushMutex.Lock()
+	defer t.memFlushMutex.Unlock()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = t.attemptFlushBuffer()
-		if err == nil {
-			if attempt > 0 {
-				log.Printf("succeeded buffer flush after %v attempts", attempt)
+	return utils.Try(t.ctx, maxFlushBufferAttempts, flushBufferAttemptInterval, func() error {
+		t.logger.Debugf("Flush buffer: started")
+		if t.memBufferPgDMLsCnt == 0 {
+			t.logger.Debugf("Flush buffer: mem buffer is empty")
+			return nil
+		}
+
+		if t.inSync {
+			t.logger.Debugf("Flush buffer: flushing to the aux table %s (cols: %v)", t.cfg.ChSyncAuxTable, t.syncAuxTableColumns())
+			if err := t.chLoader.Flush(t.cfg.ChSyncAuxTable, t.syncAuxTableColumns()); err != nil {
+				return fmt.Errorf("could not flush buffer for %q table: %v", t.cfg.ChSyncAuxTable, err)
 			}
-			break
+		} else {
+			t.logger.Debugf("Flush buffer: flushing to the main table %s", t.cfg.ChMainTable)
+			if err := t.chLoader.Flush(t.cfg.ChMainTable, t.chUsedColumns); err != nil {
+				return fmt.Errorf("could not flush buffer for %q table: %v", t.cfg.ChMainTable, err)
+			}
+
+			if err := t.advanceProcessedLSN(); err != nil {
+				return fmt.Errorf("could not advance processed lsn: %v", err)
+			}
 		}
 
-		log.Printf("could not flush buffer: %v, retrying after %v", err, attemptInterval)
-		select {
-		case <-t.ctx.Done():
-			return fmt.Errorf("abort retrying")
-		case <-time.After(attemptInterval):
-		}
-	}
+		t.logger.Debugf("Flush buffer: finished")
+		t.memBufferPgDMLsCnt = 0
+		t.bufferMaxLSN = dbtypes.InvalidLSN
 
-	return err
-}
-
-// flush from memory to the buffer/main table
-func (t *genericTable) attemptFlushBuffer() error {
-	if t.bufferCmdId == 0 {
 		return nil
-	}
-
-	if err := t.begin(); err != nil {
-		return err
-	}
-
-	if err := t.stmntPrepare(false); err != nil {
-		return err
-	}
-
-	for i := 0; i < t.bufferCmdId; i++ {
-		for _, cmd := range t.buffer[i] {
-			row := cmd.data
-			if t.cfg.ChBufferTable != "" {
-				row = append(row, cmd.rowID)
-			}
-
-			if err := t.stmntExec(row); err != nil {
-				return fmt.Errorf("could not exec(%#v): %v", row, err)
-			}
-		}
-	}
-
-	if err := t.stmntCloseCommit(); err != nil {
-		return err
-	}
-
-	t.bufferCmdId = 0
-	t.bufferFlushCnt++
-
-	return nil
+	})
 }
 
-func (t *genericTable) tryFlushToMainTable() error { //TODO: consider better name
-	for _, query := range t.flushQueries {
-		if _, err := t.chConn.Exec(query); err != nil {
-			return err
-		}
-	}
+func (t *genericTable) saveLSN(lsn dbtypes.LSN) error {
+	t.logger.Debugf("lsn %s saved", lsn)
 
-	t.bufferFlushCnt = 0
-	t.bufferRowId = 0
-
-	return nil
+	return t.persStorage.WriteLSN(t.cfg.PgTableName.KeyName(), lsn)
 }
 
-//FlushToMainTable flushes data from buffer table to the main one
-func (t *genericTable) FlushToMainTable() error {
-	t.flushMutex.Lock()
-	defer t.flushMutex.Unlock()
+//Flush flushes data from buffer table to the main one
+func (t *genericTable) Flush() error {
+	t.logger.Debugf("Flush: trying to acquire table lock")
+	t.Lock()
+	t.logger.Debugf("Flush: table lock acquired")
+	defer t.Unlock()
 
-	if err := t.flushBuffer(); err != nil {
-		return fmt.Errorf("could not flush buffers: %v", err)
-	}
-
-	if t.cfg.ChBufferTable == "" || t.bufferFlushCnt == 0 {
-		return nil
-	}
-
-	defer func(startTime time.Time, rows int) {
-		log.Printf("FlushToMainTable for %s pg table processed in %v (rows: %d)",
-			t.cfg.PgTableName.String(), time.Since(startTime).Truncate(time.Second), rows)
-	}(time.Now(), t.bufferRowId)
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := t.tryFlushToMainTable()
-		if err == nil {
-			if attempt > 0 {
-				log.Printf("succeeded flush to main table after %v attempts", attempt)
-			}
-			break
-		}
-
-		log.Printf("could not flush: %v, retrying after %v", err, attemptInterval)
-		select {
-		case <-t.ctx.Done():
-			return fmt.Errorf("abort retrying")
-		case <-time.After(attemptInterval):
-		}
-	}
-
-	if err := t.truncateBufTable(); err != nil {
-		return fmt.Errorf("could not truncate buffer table: %v", err)
-	}
-
-	return nil
+	return t.flushBuffer()
 }
 
-func convert(val string, chType config.ChColumn, pgType config.PgColumn) (interface{}, error) {
-	switch chType.BaseType {
-	case utils.ChInt8:
-		return strconv.ParseInt(val, 10, 8)
-	case utils.ChInt16:
-		return strconv.ParseInt(val, 10, 16)
-	case utils.ChInt32:
-		return strconv.ParseInt(val, 10, 32)
-	case utils.ChInt64:
-		return strconv.ParseInt(val, 10, 64)
-	case utils.ChUInt8:
-		if pgType.BaseType == utils.PgBoolean {
-			if val == pgTrue {
-				return 1, nil
-			} else if val == pgFalse {
-				return 0, nil
-			}
-		}
-
-		return nil, fmt.Errorf("can't convert %v to %v", pgType.BaseType, chType.BaseType)
-	case utils.ChUInt16:
-		return strconv.ParseUint(val, 10, 16)
-	case utils.ChUint32:
-		if pgType.BaseType == utils.PgTimeWithoutTimeZone {
-			t, err := time.Parse("15:04:05", val)
-			if err != nil {
-				return nil, err
-			}
-
-			return t.Hour()*3600 + t.Minute()*60 + t.Second(), nil
-		}
-
-		return strconv.ParseUint(val, 10, 32)
-	case utils.ChUint64:
-		return strconv.ParseUint(val, 10, 64)
-	case utils.ChFloat32:
-		return strconv.ParseFloat(val, 32)
-	case utils.ChDecimal:
-		return strconv.ParseFloat(val, 64)
-	case utils.ChFloat64:
-		return strconv.ParseFloat(val, 64)
-	case utils.ChFixedString:
-		fallthrough
-	case utils.ChString:
-		return val, nil
-	case utils.ChDate:
-		return time.Parse("2006-01-02", val[:10])
-	case utils.ChDateTime:
-		return time.Parse("2006-01-02 15:04:05", val[:19])
-	case utils.ChUUID:
-		return val, nil
-	}
-
-	return nil, fmt.Errorf("unknown type: %v", chType)
-}
-
-func (t *genericTable) convertTuples(row message.Row) []interface{} {
-	var err error
-	res := make([]interface{}, 0)
-
+func (t *genericTable) writeRowToBuffer(buf utils.Writer, row message.Row, lsn dbtypes.LSN, tableName []byte, extras ...[]byte) error {
 	for colId, col := range t.tupleColumns {
-		var val interface{}
 		if _, ok := t.columnMapping[col.Name]; !ok {
 			continue
 		}
 
-		if row[colId].Kind != message.TupleNull {
-			val, err = convert(string(row[colId].Value), t.columnMapping[col.Name], t.cfg.PgColumns[col.Name])
-			if err != nil {
-				panic(err)
+		if colId > 0 {
+			if err := buf.WriteByte(columnDelimiter); err != nil {
+				return err
 			}
 		}
 
-		res = append(res, val)
+		if err := chutils.ConvertColumn(buf, t.cfg.PgColumns[col.Name], row[colId], t.cfg.ColumnProperties[col.Name]); err != nil {
+			return err
+		}
 	}
-	if t.cfg.GenerationColumn != "" {
-		res = append(res, uint32(*t.generationID))
+
+	if err := buf.WriteByte(columnDelimiter); err != nil {
+		return err
+	}
+	if _, err := buf.Write(lsn.Decimal()); err != nil {
+		return err
 	}
 
-	return res
-}
+	if err := buf.WriteByte(columnDelimiter); err != nil {
+		return err
+	}
+	if _, err := buf.Write(tableName); err != nil {
+		return err
+	}
 
-// gets row from the copy
-func (t *genericTable) syncConvertStrings(fields []sql.NullString) ([]interface{}, error) {
-	res := make([]interface{}, 0)
-	for i, field := range fields {
-		pgColName := t.pgUsedColumns[i]
-		column := t.columnMapping[pgColName]
-
-		if !field.Valid {
-			if !column.IsNullable {
-				return nil, fmt.Errorf("got null in %s field, which is not nullable on the ClickHouse side", pgColName)
-			}
-			res = append(res, nil)
-			continue
+	for _, extra := range extras {
+		if err := buf.WriteByte(columnDelimiter); err != nil {
+			return err
 		}
 
-		val, err := convert(field.String, column, t.cfg.PgColumns[pgColName])
-		if err != nil {
-			return nil, fmt.Errorf("could not parse %q field with %s type: %v", pgColName, column.BaseType, err)
+		if _, err := buf.Write(extra); err != nil {
+			return err
 		}
-
-		res = append(res, val)
 	}
 
-	return res, nil
+	return nil
 }
 
 // Truncate truncates main and buffer(if used) tables
 func (t *genericTable) Truncate() error {
-	t.bufferCmdId = 0
+	t.memBufferPgDMLsCnt = 0
 
-	if err := t.truncateMainTable(); err != nil {
+	if err := t.truncateTable(t.cfg.ChMainTable); err != nil {
 		return err
 	}
 
-	return t.truncateBufTable()
+	return nil
 }
 
-// Init performs initialization
-func (t *genericTable) Init() error {
-	return t.truncateBufTable()
-}
+// Init performs initialization and deletes all the dirty data, if any
+func (t *genericTable) Init(lastFinalLSN dbtypes.LSN) error {
+	if lastFinalLSN.IsValid() {
+		sql := fmt.Sprintf("alter table %s delete where lsn > %d and table_name = '%s'",
+			t.cfg.ChMainTable.NamespacedName(), uint64(lastFinalLSN), t.cfg.PgTableName.NamespacedName())
 
-// SetTupleColumns sets the tuple columns
-func (t *genericTable) SetTupleColumns(tupleColumns []message.Column) {
-	//TODO: suggest alter table message for adding/deleting new/old columns on clickhouse side
-	t.tupleColumns = tupleColumns
+		t.logger.Infow("deleting all the dirty data", "sql", sql)
+		if err := t.chLoader.Exec(sql); err != nil {
+			return fmt.Errorf("could not delete dirty tuples from %s table: %v", t.cfg.ChMainTable, err)
+		}
+	}
+
+	return nil
 }
 
 func (t *genericTable) compareRows(a, b message.Row) (bool, bool) {
@@ -571,8 +346,35 @@ func (t *genericTable) compareRows(a, b message.Row) (bool, bool) {
 			if col.IsKey { // should never happen
 				keyColumnChanged = true
 			}
+		} else if a[colId].Kind != b[colId].Kind {
+			equal = false
+			if col.IsKey {
+				keyColumnChanged = true
+			}
 		}
 	}
 
 	return equal, keyColumnChanged
+}
+
+func (t *genericTable) Begin(finalLSN dbtypes.LSN) error {
+	t.logger.Debugf("Begin: trying to acquire table lock")
+	t.Lock()
+	t.logger.Debugf("Begin: table lock acquired")
+	t.txFinalLSN = finalLSN
+
+	return nil
+}
+
+func (t *genericTable) Commit() error {
+	t.lastCommittedLSN = t.txFinalLSN
+
+	t.logger.Debugf("Commit: finished")
+
+	t.Unlock()
+	return nil
+}
+
+func (t *genericTable) String() string {
+	return t.cfg.PgTableName.String()
 }

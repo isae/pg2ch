@@ -9,13 +9,13 @@ import (
 
 	"github.com/mkabilov/pg2ch/pkg/config"
 	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils"
+	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
 )
 
-// TablePgColumns returns postgresql table's columns structure
-func TablePgColumns(tx *pgx.Tx, tblName config.PgTableName) ([]message.Column, map[string]config.PgColumn, error) {
+// TablePgColumns returns PostgreSQL table's columns structure
+func TablePgColumns(tx *pgx.Tx, tblName config.PgTableName) ([]message.Column, map[string]*config.PgColumn, error) {
 	columns := make([]message.Column, 0)
-	pgColumns := make(map[string]config.PgColumn)
+	pgColumns := make(map[string]*config.PgColumn)
 
 	rows, err := tx.Query(`select
   a.attname,
@@ -48,7 +48,7 @@ order by
 			pgColumn          config.PgColumn
 			extStr            []string
 			attTypMod         int32
-			attOID            utils.OID
+			attOID            dbtypes.OID
 		)
 
 		if err := rows.Scan(&colName, &pgColumn.IsNullable, &baseType, &extStr, &pgColumn.PkCol, &attTypMod, &attOID); err != nil {
@@ -75,7 +75,7 @@ order by
 			TypeOID: attOID,
 			Mode:    attTypMod,
 		})
-		pgColumns[colName] = pgColumn
+		pgColumns[colName] = &pgColumn
 	}
 
 	return columns, pgColumns, nil

@@ -1,6 +1,7 @@
 package message
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
@@ -8,7 +9,7 @@ import (
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/pgtype"
 
-	"github.com/mkabilov/pg2ch/pkg/utils"
+	"github.com/mkabilov/pg2ch/pkg/utils/dbtypes"
 )
 
 type (
@@ -19,13 +20,13 @@ type (
 
 const (
 	ReplicaIdentityDefault ReplicaIdentity = 'd'
-	ReplicaIdentityNothing                 = 'n'
-	ReplicaIdentityIndex                   = 'i'
-	ReplicaIdentityFull                    = 'f'
+	ReplicaIdentityNothing ReplicaIdentity = 'n'
+	ReplicaIdentityIndex   ReplicaIdentity = 'i'
+	ReplicaIdentityFull    ReplicaIdentity = 'f'
 
 	TupleNull      TupleKind = 'n' // Identifies the data as NULL value.
-	TupleUnchanged           = 'u' // Identifies unchanged TOASTed value (the actual value is not sent).
-	TupleText                = 't' // Identifies the data as text formatted value.
+	TupleUnchanged TupleKind = 'u' // Identifies unchanged TOASTed value (the actual value is not sent).
+	TupleText      TupleKind = 't' // Identifies the data as text formatted value.
 
 	MsgInsert MType = iota
 	MsgUpdate
@@ -59,7 +60,7 @@ var (
 	}
 )
 
-type Row []Tuple
+type Row []*Tuple // set of columns
 
 type Message interface {
 	fmt.Stringer
@@ -71,10 +72,10 @@ type NamespacedName struct {
 }
 
 type Column struct {
-	IsKey   bool      `yaml:"IsKey"` // column as part of the key.
-	Name    string    `yaml:"Name"`  // Name of the column.
-	TypeOID utils.OID `yaml:"OID"`   // OID of the column's data type.
-	Mode    int32     `yaml:"Mode"`  // OID modifier of the column (atttypmod).
+	IsKey   bool        `yaml:"IsKey"` // column as part of the key.
+	Name    string      `yaml:"Name"`  // Name of the column.
+	TypeOID dbtypes.OID `yaml:"OID"`   // OID of the column's data type.
+	Mode    int32       `yaml:"Mode"`  // OID modifier of the column (atttypmod).
 }
 
 type Tuple struct {
@@ -83,75 +84,66 @@ type Tuple struct {
 }
 
 type Begin struct {
-	Raw       []byte
-	FinalLSN  utils.LSN // LSN of the record that lead to this xact to be committed
-	Timestamp time.Time // Commit timestamp of the transaction
-	XID       int32     // Xid of the transaction.
+	FinalLSN  dbtypes.LSN // LSN of the record that lead to this xact to be committed
+	Timestamp time.Time   // Commit timestamp of the transaction
+	XID       int32       // Xid of the transaction.
 }
 
 type Commit struct {
-	Raw            []byte
-	Flags          uint8     // Flags; currently unused (must be 0)
-	LSN            utils.LSN // The LastLSN of the commit.
-	TransactionLSN utils.LSN // LSN pointing to the end of the commit record + 1
-	Timestamp      time.Time // Commit timestamp of the transaction
+	Flags          uint8       // Flags; currently unused (must be 0)
+	LSN            dbtypes.LSN // The LastLSN of the commit.
+	TransactionLSN dbtypes.LSN // LSN pointing to the end of the commit record + 1
+	Timestamp      time.Time   // Commit timestamp of the transaction
 }
 
 type Origin struct {
-	Raw  []byte
-	LSN  utils.LSN // The last LSN of the commit on the origin server.
+	LSN  dbtypes.LSN // The last LSN of the commit on the origin server.
 	Name string
 }
 
 type Relation struct {
 	NamespacedName `yaml:"NamespacedName"`
 
-	Raw             []byte          `yaml:"-"`
-	OID             utils.OID       `yaml:"OID"`             // OID of the relation.
+	OID             dbtypes.OID     `yaml:"OID"`             // OID of the relation.
 	ReplicaIdentity ReplicaIdentity `yaml:"ReplicaIdentity"` // Replica identity
 	Columns         []Column        `yaml:"Columns"`         // Columns
 }
 
 type Insert struct {
-	Raw         []byte
-	RelationOID utils.OID // OID of the relation corresponding to the OID in the relation message.
-	IsNew       bool      // Identifies tuple as a new tuple.
+	RelationOID dbtypes.OID // OID of the relation corresponding to the OID in the relation message.
+	IsNew       bool        // Identifies tuple as a new tuple.
 
 	NewRow Row
 }
 
 type Update struct {
-	Raw         []byte
-	RelationOID utils.OID // OID of the relation corresponding to the OID in the relation message.
-	IsKey       bool      // OldRow contains columns which are part of REPLICA IDENTITY index.
-	IsOld       bool      // OldRow contains old tuple in case of REPLICA IDENTITY set to FULL
-	IsNew       bool      // Identifies tuple as a new tuple.
+	RelationOID dbtypes.OID // OID of the relation corresponding to the OID in the relation message.
+	IsKey       bool        // OldRow contains columns which are part of REPLICA IDENTITY index.
+	IsOld       bool        // OldRow contains old tuple in case of REPLICA IDENTITY set to FULL
+	IsNew       bool        // Identifies tuple as a new tuple.
 
 	OldRow Row
 	NewRow Row
 }
 
 type Delete struct {
-	Raw         []byte
-	RelationOID utils.OID // OID of the relation corresponding to the OID in the relation message.
-	IsKey       bool      // OldRow contains columns which are part of REPLICA IDENTITY index.
-	IsOld       bool      // OldRow contains old tuple in case of REPLICA IDENTITY set to FULL
+	RelationOID dbtypes.OID // OID of the relation corresponding to the OID in the relation message.
+	IsKey       bool        // OldRow contains columns which are part of REPLICA IDENTITY index.
+	IsOld       bool        // OldRow contains old tuple in case of REPLICA IDENTITY set to FULL
 
 	OldRow Row
 }
 
 type Truncate struct {
-	Raw             []byte
 	Cascade         bool
 	RestartIdentity bool
-	RelationOIDs    []utils.OID
+	RelationOIDs    []dbtypes.OID
 }
 
 type Type struct {
 	NamespacedName
 
-	Raw []byte
-	OID utils.OID // OID of the data type
+	OID dbtypes.OID // OID of the data type
 }
 
 func (t MType) String() string {
@@ -166,7 +158,7 @@ func (t MType) String() string {
 func (t Tuple) String() string {
 	switch t.Kind {
 	case TupleText:
-		return utils.QuoteLiteral(string(t.Value))
+		return string(t.Value)
 	case TupleNull:
 		return "null"
 	case TupleUnchanged:
@@ -176,20 +168,42 @@ func (t Tuple) String() string {
 	return "unknown"
 }
 
+func (t Tuple) Bytes() []byte {
+	res := []byte{uint8(t.Kind)}
+
+	if t.Kind == TupleText {
+		sz := make([]byte, 4)
+		binary.BigEndian.PutUint32(sz, uint32(len(t.Value)))
+		res = append(res, sz...)
+		res = append(res, t.Value...)
+	}
+
+	return res
+}
+
+func (r Row) Bytes() []byte {
+	res := make([]byte, 0)
+	for _, tuple := range r {
+		res = append(res, tuple.Bytes()...)
+	}
+
+	return res
+}
+
 func (m Begin) String() string {
 	return fmt.Sprintf("FinalLSN:%s Timestamp:%v XID:%d",
 		m.FinalLSN.String(), m.Timestamp.Format(time.RFC3339), m.XID)
 }
 
-func (m Relation) String() string {
+func (r Relation) String() string {
 	parts := make([]string, 0)
 
-	parts = append(parts, fmt.Sprintf("OID:%s", m.OID))
-	parts = append(parts, fmt.Sprintf("Name:%s", m.NamespacedName))
-	parts = append(parts, fmt.Sprintf("RepIdentity:%s", m.ReplicaIdentity))
+	parts = append(parts, fmt.Sprintf("OID:%s", r.OID))
+	parts = append(parts, fmt.Sprintf("Name:%s", r.NamespacedName))
+	parts = append(parts, fmt.Sprintf("RepIdentity:%s", r.ReplicaIdentity))
 
 	columns := make([]string, 0)
-	for _, c := range m.Columns {
+	for _, c := range r.Columns {
 		var isKey, mode string
 
 		if c.IsKey {
@@ -358,7 +372,7 @@ func (r *ReplicaIdentity) DecodeText(ci *pgtype.ConnInfo, src []byte) error {
 		return nil
 	}
 
-	*r = ReplicaIdentity(uint8(src[0]))
+	*r = ReplicaIdentity(src[0])
 
 	return nil
 }
@@ -386,4 +400,41 @@ func (n NamespacedName) String() string {
 
 func (n NamespacedName) Sanitize() string {
 	return pgx.Identifier{n.Namespace, n.Name}.Sanitize()
+}
+
+func (r *Relation) Equal(rel2 *Relation) bool {
+	if r.OID != rel2.OID {
+		return false
+	}
+	if r.Name != rel2.Name || r.Namespace != rel2.Namespace {
+		return false
+	}
+
+	if r.ReplicaIdentity != rel2.ReplicaIdentity {
+		return false
+	}
+
+	if len(r.Columns) != len(rel2.Columns) {
+		return false
+	}
+
+	for colID := range r.Columns {
+		if r.Columns[colID].Name != rel2.Columns[colID].Name {
+			return false
+		}
+
+		if r.Columns[colID].IsKey != rel2.Columns[colID].IsKey {
+			return false
+		}
+
+		if r.Columns[colID].Mode != rel2.Columns[colID].Mode {
+			return false
+		}
+
+		if r.Columns[colID].TypeOID != rel2.Columns[colID].TypeOID {
+			return false
+		}
+	}
+
+	return true
 }
