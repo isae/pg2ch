@@ -2,16 +2,17 @@ package replicator
 
 import (
 	"fmt"
-	"log"
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/redcon"
+
+	"pg2ch/pkg/config"
 )
 
-const forbiddenError = "cannot modify '" + tableLSNKeyPrefix + "*' keys"
-
-func (r *Replicator) redisServer() {
-	err := redcon.ListenAndServe(r.cfg.RedisBind,
+func (r *Replicator) startRedisServer() {
+	r.logger.Infof("starting redis-like server: %v", r.cfg.RedisBind)
+	redisServer := redcon.NewServer(r.cfg.RedisBind,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			switch strings.ToLower(string(cmd.Args[0])) {
 			case "ping":
@@ -19,41 +20,31 @@ func (r *Replicator) redisServer() {
 			case "quit":
 				conn.WriteString("OK")
 				if err := conn.Close(); err != nil {
-					log.Printf("could not close redis connection: %v", err)
+					r.logger.Warnf("could not close redis connection: %v", err)
 				}
-			case "set":
-				if len(cmd.Args) != 3 {
-					conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-					return
-				}
-				key := string(cmd.Args[1])
-				value := cmd.Args[2]
-
-				if strings.HasPrefix(key, tableLSNKeyPrefix) {
-					conn.WriteString(fmt.Sprintf("ERR: %s", forbiddenError))
-					return
-				}
-
-				if err := r.persStorage.Write(key, value); err != nil {
-					conn.WriteString(fmt.Sprintf("ERR: %s", err))
-				} else {
-					conn.WriteString("OK")
-				}
+			case "lsn":
+				conn.WriteString(fmt.Sprintf("last final LSN: %v", r.consumer.CurrentLSN().String()))
 			case "get":
 				if len(cmd.Args) != 2 {
 					conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 					return
 				}
-				key := string(cmd.Args[1])
-				value, err := r.persStorage.Read(key)
+				key := config.TableLSNKeyPrefix + string(cmd.Args[1])
+				lsn, err := r.persStorage.ReadLSN(key)
 				if err != nil {
 					conn.WriteNull()
 				} else {
-					conn.WriteBulk(value)
+					conn.WriteString(lsn.String())
 				}
 			case "keys":
+				for _, key := range r.persStorage.Keys() {
+					if !strings.HasPrefix(key, config.TableLSNKeyPrefix) {
+						continue
+					}
+
+					conn.WriteString(key[len(config.TableLSNKeyPrefix):])
+				}
 				conn.WriteString("OK")
-				//TODO
 			case "exists":
 				if len(cmd.Args) != 2 {
 					conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -78,12 +69,26 @@ func (r *Replicator) redisServer() {
 				} else {
 					conn.WriteInt(1)
 				}
+			case "sync":
+				if len(cmd.Args) != 3 {
+					conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+					return
+				}
+
+				if strings.ToLower(string(cmd.Args[1])) == "sleep" {
+					seconds, err := strconv.Atoi(string(cmd.Args[2]))
+					if err != nil {
+						conn.WriteError("ERR wrong value for sync sleep: " + err.Error())
+					}
+					r.syncSleep.Store(int32(seconds))
+					conn.WriteString("OK")
+				}
 			case "pause":
-				//TODO
-				conn.WriteString("OK")
+				conn.WriteString(r.pause())
 			case "resume":
-				//TODO
-				conn.WriteString("OK")
+				conn.WriteString(r.resume())
+			case "status":
+				conn.WriteString(r.curState.String())
 			default:
 				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
 			}
@@ -93,7 +98,7 @@ func (r *Replicator) redisServer() {
 		func(conn redcon.Conn, err error) {},
 	)
 
-	if err != nil {
+	if err := redisServer.ListenAndServe(); err != nil {
 		select {
 		case r.errCh <- err:
 		default:

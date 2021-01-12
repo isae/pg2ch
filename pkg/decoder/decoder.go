@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mkabilov/pg2ch/pkg/message"
-	"github.com/mkabilov/pg2ch/pkg/utils"
+	"pg2ch/pkg/message"
+	"pg2ch/pkg/utils/dbtypes"
 )
 
 type decoder struct {
@@ -20,16 +20,26 @@ type decoder struct {
 const (
 	truncateCascadeBit         = 1
 	truncateRestartIdentityBit = 2
+
+	InsertMsgType   = 'I'
+	DeleteMsgType   = 'D'
+	UpdateMsgType   = 'U'
+	TruncateMsgType = 'T'
+	BeginMsgType    = 'B'
+	CommitMsgType   = 'C'
+	TypeMsgType     = 'Y'
+	OriginMsgType   = 'O'
+	RelationMsgType = 'R'
 )
 
 func (d *decoder) bool() bool { return d.buf.Next(1)[0] != 0 }
 
-func (d *decoder) uint8() uint8   { return d.buf.Next(1)[0] }
-func (d *decoder) uint16() uint16 { return d.order.Uint16(d.buf.Next(2)) }
-func (d *decoder) uint32() uint32 { return d.order.Uint32(d.buf.Next(4)) }
-func (d *decoder) uint64() uint64 { return d.order.Uint64(d.buf.Next(8)) }
-func (d *decoder) oid() utils.OID { return utils.OID(d.uint32()) }
-func (d *decoder) lsn() utils.LSN { return utils.LSN(d.uint64()) }
+func (d *decoder) uint8() uint8     { return d.buf.Next(1)[0] }
+func (d *decoder) uint16() uint16   { return d.order.Uint16(d.buf.Next(2)) }
+func (d *decoder) uint32() uint32   { return d.order.Uint32(d.buf.Next(4)) }
+func (d *decoder) uint64() uint64   { return d.order.Uint64(d.buf.Next(8)) }
+func (d *decoder) oid() dbtypes.OID { return dbtypes.OID(d.uint32()) }
+func (d *decoder) lsn() dbtypes.LSN { return dbtypes.LSN(d.uint64()) }
 
 func (d *decoder) int8() int8   { return int8(d.uint8()) }
 func (d *decoder) int16() int16 { return int16(d.uint16()) }
@@ -61,18 +71,18 @@ func (d *decoder) rowInfo(char byte) bool {
 	return false
 }
 
-func (d *decoder) tupledata() []message.Tuple {
+func (d *decoder) tupleData() []*message.Tuple {
 	size := int(d.uint16())
-	data := make([]message.Tuple, size)
+	data := make([]*message.Tuple, size)
 	for i := 0; i < size; i++ {
 		switch d.buf.Next(1)[0] {
-		case 'n':
-			data[i] = message.Tuple{Kind: message.TupleNull, Value: []byte{}}
-		case 'u':
-			data[i] = message.Tuple{Kind: message.TupleUnchanged, Value: []byte{}}
 		case 't':
 			vsize := int(d.order.Uint32(d.buf.Next(4)))
-			data[i] = message.Tuple{Kind: message.TupleText, Value: d.buf.Next(vsize)}
+			data[i] = &message.Tuple{Kind: message.TupleText, Value: d.buf.Next(vsize)}
+		case 'n':
+			data[i] = &message.Tuple{Kind: message.TupleNull, Value: []byte{}}
+		case 'u':
+			data[i] = &message.Tuple{Kind: message.TupleUnchanged, Value: []byte{}}
 		}
 	}
 
@@ -99,22 +109,16 @@ func Parse(src []byte) (message.Message, error) {
 	msgType := src[0]
 	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
 	switch msgType {
-	case 'B':
-		m := message.Begin{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case BeginMsgType:
+		m := &message.Begin{}
 
 		m.FinalLSN = d.lsn()
 		m.Timestamp = d.timestamp()
 		m.XID = d.int32()
 
 		return m, nil
-	case 'C':
-		m := message.Commit{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case CommitMsgType:
+		m := &message.Commit{}
 
 		m.Flags = d.uint8()
 		m.LSN = d.lsn()
@@ -122,21 +126,15 @@ func Parse(src []byte) (message.Message, error) {
 		m.Timestamp = d.timestamp()
 
 		return m, nil
-	case 'O':
-		m := message.Origin{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case OriginMsgType:
+		m := &message.Origin{}
 
 		m.LSN = d.lsn()
 		m.Name = d.string()
 
 		return m, nil
-	case 'R':
-		m := message.Relation{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case RelationMsgType:
+		m := &message.Relation{}
 
 		m.OID = d.oid()
 		m.Namespace = d.string()
@@ -145,68 +143,53 @@ func Parse(src []byte) (message.Message, error) {
 		m.Columns = d.columns()
 
 		return m, nil
-	case 'Y':
-		m := message.Type{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case TypeMsgType:
+		m := &message.Type{}
 
 		m.OID = d.oid()
 		m.Namespace = d.string()
 		m.Name = d.string()
 
 		return m, nil
-	case 'I':
-		m := message.Insert{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case InsertMsgType:
+		m := &message.Insert{}
 
 		m.RelationOID = d.oid()
 		m.IsNew = d.uint8() == 'N'
-		m.NewRow = d.tupledata()
+		m.NewRow = d.tupleData()
 
 		return m, nil
-	case 'U':
-		m := message.Update{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case UpdateMsgType:
+		m := &message.Update{}
 
 		m.RelationOID = d.oid()
 		m.IsKey = d.rowInfo('K')
 		m.IsOld = d.rowInfo('O')
 		if m.IsKey || m.IsOld {
-			m.OldRow = d.tupledata()
+			m.OldRow = d.tupleData()
 		}
 		m.IsNew = d.uint8() == 'N'
-		m.NewRow = d.tupledata()
+		m.NewRow = d.tupleData()
 
 		return m, nil
-	case 'D':
-		m := message.Delete{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case DeleteMsgType:
+		m := &message.Delete{}
 
 		m.RelationOID = d.oid()
 		m.IsKey = d.rowInfo('K')
 		m.IsOld = d.rowInfo('O')
-		m.OldRow = d.tupledata()
+		m.OldRow = d.tupleData()
 
 		return m, nil
-	case 'T':
-		m := message.Truncate{
-			Raw: make([]byte, len(src)),
-		}
-		copy(m.Raw, src)
+	case TruncateMsgType:
+		m := &message.Truncate{}
 
 		relationsCnt := int(d.uint32())
 		options := d.uint8()
 		m.Cascade = options&truncateCascadeBit == 1
 		m.RestartIdentity = options&truncateRestartIdentityBit == 1
 
-		m.RelationOIDs = make([]utils.OID, relationsCnt)
+		m.RelationOIDs = make([]dbtypes.OID, relationsCnt)
 		for i := 0; i < relationsCnt; i++ {
 			m.RelationOIDs[i] = d.oid()
 		}

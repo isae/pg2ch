@@ -12,3 +12,6 @@
 *.out
 
 .idea
+
+# Ignore binary
+pg2ch
