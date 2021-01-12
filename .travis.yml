@@ -18,7 +18,7 @@ script:
     - docker-compose run tests
     - docker-compose stop clickhouse
 
-env:
-    - PG_VERSION=10
-    - PG_VERSION=11
+env: #TODO get back older postgres versions
+    #- PG_VERSION=10
+    #- PG_VERSION=11
     - PG_VERSION=12
