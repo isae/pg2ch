@@ -13,7 +13,6 @@ require (
 	github.com/jackc/fake v0.0.0-20150926172116-812a484cc733 // indirect
 	github.com/jackc/pgx v3.5.1-0.20190902172015-f26e4c0e6921+incompatible
 	github.com/lib/pq v1.2.0 // indirect
-	github.com/mkabilov/pg2ch v1.0.0
 	github.com/peterbourgon/diskv v2.0.1+incompatible
 	github.com/pkg/errors v0.8.1 // indirect
 	github.com/satori/go.uuid v1.2.0 // indirect
